@@ -41,13 +41,13 @@ function videoTrackGray(canvas, width, height) {
   return result;
 }
 // Sample high-contrast points throughout the frame, so blank areas do not dominate.
-function videoTrackFeatures(image,w,h) {
+function videoTrackFeatures(image,w,h,contrast=8) {
   const points=[];
   for(let ty=2;ty<h-2;ty+=24) for(let tx=2;tx<w-2;tx+=24) {
     const candidates=[];
     for(let y=ty;y<Math.min(ty+24,h-2);y+=2) for(let x=tx;x<Math.min(tx+24,w-2);x+=2) {
       const i=y*w+x, strength=Math.abs(image[i+1]-image[i-1])+Math.abs(image[i+w]-image[i-w]);
-      if(strength>=8) candidates.push({x,y,value:image[i],strength});
+      if(strength>=contrast) candidates.push({x,y,value:image[i],strength});
     }
     candidates.sort((a,b)=>b.strength-a.strength);
     points.push(...candidates.slice(0,4));
@@ -56,27 +56,29 @@ function videoTrackFeatures(image,w,h) {
 }
 // Current (x,y) maps to reference (dx + scale*x, dy + scale*y).
 function videoTrackFeatureScore(reference,points,w,h,dx,dy,scale=1) {
-  let total=0,count=0; const regions=new Float64Array(8),regionCounts=new Uint16Array(8);
+  let total=0,count=0,weightTotal=0; const regions=new Float64Array(8),regionCounts=new Uint16Array(8);
   for(const p of points) {
     const x=Math.round(dx+scale*p.x),y=Math.round(dy+scale*p.y);
     if(x<1||x>=w-1||y<1||y>=h-1)continue;
     const diff=Math.min(60,Math.abs(p.value-reference[y*w+x]));
+    // Strong features carry more evidence than low-contrast background noise.
+    const weight=Math.min(32,Math.max(1,p.strength));
     const region=Math.min(3,Math.floor(p.x*4/w))+4*Math.min(1,Math.floor(p.y*2/h));
-    total+=diff;count++;regions[region]+=diff;regionCounts[region]++;
+    total+=diff*weight;weightTotal+=weight;count++;regions[region]+=diff;regionCounts[region]++;
   }
   if(count<Math.max(12,points.length*.5))return {score:Infinity,regions,regionCounts};
-  return {score:total/count,regions,regionCounts};
+  return {score:total/weightTotal,regions,regionCounts};
 }
-function videoTrackMatch(reference,current,w,h,predicted={dx:0,dy:0,scale:1},threshold=10) {
-  const points=videoTrackFeatures(current,w,h);
+function videoTrackMatch(reference,current,w,h,predicted={dx:0,dy:0,scale:1},threshold=10,settings={}) {
+  const points=videoTrackFeatures(current,w,h,settings.contrast ?? 8);
   if(points.length<12)return {dx:predicted.dx,dy:predicted.dy,scale:predicted.scale,uncertain:true,score:Infinity};
   let best={dx:Math.round(predicted.dx),dy:Math.round(predicted.dy),scale:predicted.scale,score:Infinity};
-  const radius=Math.max(10,Math.round(Math.min(w,h)*.05)), cx=Math.round(predicted.dx),cy=Math.round(predicted.dy);
+  const radius=Math.max(10,Math.round(Math.min(w,h)*(settings.radius ?? .05))), cx=Math.round(predicted.dx),cy=Math.round(predicted.dy);
   function search(scale,range,step) {
     for(let dy=cy-range;dy<=cy+range;dy+=step)for(let dx=cx-range;dx<=cx+range;dx+=step){
       const result=videoTrackFeatureScore(reference,points,w,h,dx,dy,scale);
       // Penalize scale changes and large jumps slightly when several matches are similar.
-      const adjusted=result.score+Math.hypot(dx-predicted.dx,dy-predicted.dy)*.12;
+      const adjusted=result.score+Math.hypot(dx-predicted.dx,dy-predicted.dy)*.01;
       if(adjusted<best.score)best={dx,dy,scale,score:adjusted,raw:result};
     }
   }
@@ -86,16 +88,16 @@ function videoTrackMatch(reference,current,w,h,predicted={dx:0,dy:0,scale:1},thr
     const rangeX=Math.round(w*.4),rangeY=Math.round(h*.4);
     for(let dy=-rangeY;dy<=rangeY;dy++)for(let dx=cx-2;dx<=cx+2;dx++){
       const raw=videoTrackFeatureScore(reference,points,w,h,dx,dy,predicted.scale);
-      if(raw.score+Math.hypot(dx-cx,dy-cy)*.12<best.score)best={dx,dy,scale:predicted.scale,score:raw.score+Math.hypot(dx-cx,dy-cy)*.12,raw};
+      if(raw.score+Math.hypot(dx-cx,dy-cy)*.01<best.score)best={dx,dy,scale:predicted.scale,score:raw.score+Math.hypot(dx-cx,dy-cy)*.01,raw};
     }
     for(let dx=-rangeX;dx<=rangeX;dx++)for(let dy=cy-2;dy<=cy+2;dy++){
       const raw=videoTrackFeatureScore(reference,points,w,h,dx,dy,predicted.scale);
-      if(raw.score+Math.hypot(dx-cx,dy-cy)*.12<best.score)best={dx,dy,scale:predicted.scale,score:raw.score+Math.hypot(dx-cx,dy-cy)*.12,raw};
+      if(raw.score+Math.hypot(dx-cx,dy-cy)*.01<best.score)best={dx,dy,scale:predicted.scale,score:raw.score+Math.hypot(dx-cx,dy-cy)*.01,raw};
     }
   }
   // Test zoom only at the best translation; it must win clearly across independent regions.
   const translation={...best}, alternatives=[];
-  for(const factor of [.94,.97,1.03,1.06]) {
+  for(const factor of (settings.zoom === false ? [] : [.94,.97,1.03,1.06])) {
     const scale=predicted.scale*factor;
     for(let dy=translation.dy-2;dy<=translation.dy+2;dy++)for(let dx=translation.dx-2;dx<=translation.dx+2;dx++){
       const raw=videoTrackFeatureScore(reference,points,w,h,dx,dy,scale);
@@ -104,7 +106,7 @@ function videoTrackMatch(reference,current,w,h,predicted={dx:0,dy:0,scale:1},thr
   }
   alternatives.sort((a,b)=>a.score-b.score);
   const zoom=alternatives[0];
-  if(zoom && zoom.score+1<translation.raw.score*.8){
+  if(zoom && translation.raw && zoom.score+1<translation.raw.score*.8){
     let improved=0,eligible=0;
     for(let i=0;i<8;i++)if(translation.raw.regionCounts[i]>=3&&zoom.raw.regionCounts[i]>=3){eligible++;if(zoom.raw.regions[i]/zoom.raw.regionCounts[i]+1<translation.raw.regions[i]/translation.raw.regionCounts[i]*.85)improved++;}
     if(eligible>=3&&improved>=Math.max(3,Math.ceil(eligible*.6)))best=zoom;
@@ -122,13 +124,24 @@ $('#runVideoTrack').onclick = async () => {
   const name = $('#videoTrackFile').value, folder = dir, threshold = Number($('#videoTrackThreshold').value), status = $('#videoTrackStatus');
   if (!name || !folder) return;
   if (!Number.isFinite(threshold) || threshold < 0 || threshold > 255 || $('#videoTrackThreshold').value === '') { status.textContent = 'Enter a threshold between 0 and 255.'; return; }
+  const settings = {resolution:Number($('#videoTrackResolution').value), radius:Number($('#videoTrackRadius').value), contrast:Number($('#videoTrackContrast').value), samples:Number($('#videoTrackSamples').value), zoom:$('#videoTrackZoom').checked};
+  const bounds = [['#videoTrackResolution',settings.resolution,64,1024],['#videoTrackRadius',settings.radius,1,25],['#videoTrackContrast',settings.contrast,0,510],['#videoTrackSamples',settings.samples,1,100]];
+  if (bounds.some(([id,value,min,max]) => $(id).value === '' || !Number.isInteger(value) || value < min || value > max)) { status.textContent = 'Check the advanced tracking settings and enter whole numbers within the indicated limits.'; return; }
+  settings.radius /= 100;
   clearVideoTrackResult();
-  const controls = ['#runVideoTrack','#videoTrackFile','#videoTrackThreshold','#refreshVideoTrackFiles']; controls.forEach(id => $(id).disabled = true);
-  let input, output;
+  const controls = ['#runVideoTrack','#videoTrackFile','#videoTrackThreshold','#refreshVideoTrackFiles','#videoTrackResolution','#videoTrackRadius','#videoTrackContrast','#videoTrackSamples','#videoTrackZoom']; controls.forEach(id => $(id).disabled = true);
+  let input, output, cancelled = false;
+  const cancelButton = $('#cancelVideoTrack'); cancelButton.hidden = false; cancelButton.disabled = false;
+  cancelButton.onclick = () => { cancelled = true; cancelButton.disabled = true; status.textContent = 'Cancelling…'; };
+  const checkCancelled = () => { if (cancelled) throw new Error('Cancelled'); };
   try {
     const file = await (await folder.getFileHandle(name)).getFile(), m = await import('./mediabunny.mjs');
     input = new m.Input({formats:m.ALL_FORMATS,source:new m.BlobSource(file)});
     const track = await input.getPrimaryVideoTrack(); if (!track || !await track.canDecode()) throw new Error('This browser cannot decode the selected video.');
+    status.textContent = 'Counting video packets…'; await videoTrackYield(); checkCancelled();
+    const packetStats = await track.computePacketStats(); checkCancelled();
+    // Packet count is usually the frame count, but may differ for some codecs.
+    const totalFrames = packetStats.packetCount;
     const sink = new m.CanvasSink(track,{poolSize:1}), positions = [];
     let reference, referenceTransform, predicted={dx:0,dy:0,scale:1}, uncertainFrames=0, uncertainTimes=[], width, height, sw, sh, transform = {x:0,y:0,scale:1};
     const live=$('#videoTrackLive'), liveCtx=live.getContext('2d'), snapshot=document.createElement('canvas');
@@ -144,11 +157,12 @@ $('#runVideoTrack').onclick = async () => {
       liveCtx.drawImage(frame.canvas,next.x+p.x*scale,next.y+p.y*scale,width*p.scale*scale,height*p.scale*scale);view=next;
     }
     for await (const frame of sink.canvases()) {
-      if (!width) { width=frame.canvas.width; height=frame.canvas.height; const ratio=Math.min(1,384/Math.max(width,height)); sw=Math.max(1,Math.round(width*ratio)); sh=Math.max(1,Math.round(height*ratio)); }
+      checkCancelled();
+      if (!width) { width=frame.canvas.width; height=frame.canvas.height; const ratio=Math.min(1,settings.resolution/Math.max(width,height)); sw=Math.max(1,Math.round(width*ratio)); sh=Math.max(1,Math.round(height*ratio)); }
       if (frame.canvas.width !== width || frame.canvas.height !== height) throw new Error('Video dimensions changed during processing.');
       const current = videoTrackGray(frame.canvas,sw,sh);
       if (reference) {
-        const match=videoTrackMatch(reference,current,sw,sh,predicted,threshold);
+        const match=videoTrackMatch(reference,current,sw,sh,predicted,threshold,settings);
         if(match.uncertain){uncertainFrames++;uncertainTimes.push(Math.max(0,frame.timestamp-positions[0].timestamp));}
         transform={x:referenceTransform.x+referenceTransform.scale*match.dx*width/sw,y:referenceTransform.y+referenceTransform.scale*match.dy*height/sh,scale:referenceTransform.scale*match.scale};
         predicted={dx:match.dx,dy:match.dy,scale:match.scale};
@@ -157,7 +171,7 @@ $('#runVideoTrack').onclick = async () => {
       } else {reference=current;referenceTransform={...transform};}
       if (!Number.isFinite(transform.scale) || transform.scale < .02 || transform.scale > 50) throw new Error('Tracking produced an impractical scale. Try a different threshold or video.');
       positions.push({...transform,timestamp:frame.timestamp,duration:frame.duration});
-      showTrackedFrame(frame,transform); status.textContent=`Tracking frame ${positions.length}… ${uncertainFrames} uncertain matches.`; await videoTrackYield();
+      showTrackedFrame(frame,transform); status.textContent=`Tracking frame ${positions.length}${totalFrames ? `/${totalFrames}` : ''}… ${uncertainFrames} uncertain matches.`; await videoTrackYield();
     }
     if (!positions.length) throw new Error('The video contains no decodable frames.');
     let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity,minScale=Infinity;
@@ -167,27 +181,28 @@ $('#runVideoTrack').onclick = async () => {
     if (!Number.isFinite(outWidth*outHeight) || outWidth>16384 || outHeight>16384 || outWidth*outHeight>16000000) throw new Error(`The tracked canvas (${outWidth} × ${outHeight}) is too large for this browser. Try a shorter video or a different threshold.`);
     const groups=new Map();
     positions.forEach((p,i)=>{const key=`${Math.round(p.x/2)},${Math.round(p.y/2)},${Math.round(p.scale*1000)}`; if(!groups.has(key)) groups.set(key,[]); groups.get(key).push(i)});
-    const chosen=new Set(); for(const indices of groups.values()) {const n=Math.min(10,indices.length); for(let i=0;i<n;i++) chosen.add(indices[Math.floor((i+.5)*indices.length/n)]);}
+    const chosen=new Set(); for(const indices of groups.values()) {const n=Math.min(settings.samples,indices.length); for(let i=0;i<n;i++) chosen.add(indices[Math.floor((i+.5)*indices.length/n)]);}
     const sums=new Float32Array(outWidth*outHeight*3), counts=new Uint32Array(outWidth*outHeight), temp=document.createElement('canvas'); temp.width=outWidth;temp.height=outHeight;
     const tctx=temp.getContext('2d',{willReadFrequently:true}); let index=0;
     status.textContent=`Averaging ${chosen.size} sampled frames…`; await videoTrackYield();
     for await (const frame of sink.canvases()) {
+      checkCancelled();
       const p=positions[index]; if (chosen.has(index)) {
         const x=(p.x-minX)/minScale,y=(p.y-minY)/minScale,w=width*p.scale/minScale,h=height*p.scale/minScale;
         const left=Math.max(0,Math.floor(x)),top=Math.max(0,Math.floor(y)),right=Math.min(outWidth,Math.ceil(x+w)),bottom=Math.min(outHeight,Math.ceil(y+h));
         tctx.clearRect(left,top,right-left,bottom-top); tctx.drawImage(frame.canvas,x,y,w,h);
         const pixels=tctx.getImageData(left,top,right-left,bottom-top).data;
-        for(let yy=top;yy<bottom;yy++) for(let xx=left;xx<right;xx++){const j=((yy-top)*(right-left)+xx-left)*4;if(!pixels[j+3])continue;const k=yy*outWidth+xx;counts[k]++;sums[k*3]+=pixels[j];sums[k*3+1]+=pixels[j+1];sums[k*3+2]+=pixels[j+2];}
+        for(let yy=top;yy<bottom;yy++) { if ((yy-top)%32===0) { await videoTrackYield(); checkCancelled(); } for(let xx=left;xx<right;xx++){const j=((yy-top)*(right-left)+xx-left)*4;if(!pixels[j+3])continue;const k=yy*outWidth+xx;counts[k]++;sums[k*3]+=pixels[j];sums[k*3+1]+=pixels[j+1];sums[k*3+2]+=pixels[j+2];}}
       }
       index++; if(index%10===0){status.textContent=`Averaging frames: ${index} / ${positions.length}…`;await videoTrackYield();}
     }
     const average=$('#videoAverage'); average.width=outWidth;average.height=outHeight;const actx=average.getContext('2d'), image=actx.createImageData(outWidth,outHeight);
-    for(let i=0;i<counts.length;i++){if(counts[i]){image.data[i*4]=sums[i*3]/counts[i];image.data[i*4+1]=sums[i*3+1]/counts[i];image.data[i*4+2]=sums[i*3+2]/counts[i];image.data[i*4+3]=255;}}
+    for(let i=0;i<counts.length;i++){if(i%262144===0){await videoTrackYield();checkCancelled();}if(counts[i]){image.data[i*4]=sums[i*3]/counts[i];image.data[i*4+1]=sums[i*3+1]/counts[i];image.data[i*4+2]=sums[i*3+2]/counts[i];image.data[i*4+3]=255;}}
     actx.putImageData(image,0,0); const png=await new Promise(resolve=>average.toBlob(resolve,'image/png')); if(!png)throw new Error('Could not create the averaged image.');
     const canvas=document.createElement('canvas');canvas.width=outWidth;canvas.height=outHeight;const ctx=canvas.getContext('2d'),target=new m.BufferTarget();
     output=new m.Output({format:new m.WebMOutputFormat(),target});const source=new m.CanvasSource(canvas,{codec:'vp9',bitrate:m.QUALITY_HIGH});output.addVideoTrack(source);await output.start();index=0;
-    for await (const frame of sink.canvases()) {const p=positions[index];ctx.fillStyle='#000';ctx.fillRect(0,0,outWidth,outHeight);ctx.drawImage(average,0,0);ctx.drawImage(frame.canvas,(p.x-minX)/minScale,(p.y-minY)/minScale,width*p.scale/minScale,height*p.scale/minScale);liveCtx.clearRect(0,0,live.width,live.height);const fit=Math.min(live.width/outWidth,live.height/outHeight);liveCtx.drawImage(canvas,(live.width-outWidth*fit)/2,(live.height-outHeight*fit)/2,outWidth*fit,outHeight*fit);await source.add(Math.max(0,frame.timestamp-positions[0].timestamp),frame.duration);index++;if(index%10===0){status.textContent=`Rendering frame ${index} / ${positions.length}…`;await videoTrackYield();}}
-    status.textContent='Finishing video…';await output.finalize();
+    for await (const frame of sink.canvases()) {checkCancelled();const p=positions[index];ctx.fillStyle='#000';ctx.fillRect(0,0,outWidth,outHeight);ctx.drawImage(average,0,0);ctx.drawImage(frame.canvas,(p.x-minX)/minScale,(p.y-minY)/minScale,width*p.scale/minScale,height*p.scale/minScale);liveCtx.clearRect(0,0,live.width,live.height);const fit=Math.min(live.width/outWidth,live.height/outHeight);liveCtx.drawImage(canvas,(live.width-outWidth*fit)/2,(live.height-outHeight*fit)/2,outWidth*fit,outHeight*fit);await source.add(Math.max(0,frame.timestamp-positions[0].timestamp),frame.duration);index++;if(index%10===0){status.textContent=`Rendering frame ${index} / ${positions.length}…`;await videoTrackYield();}}
+    checkCancelled();status.textContent='Finishing video…';await output.finalize();checkCancelled();
     videoTrackBlob=new Blob([target.buffer],{type:'video/webm'});videoTrackUrl=URL.createObjectURL(videoTrackBlob);videoAverageUrl=URL.createObjectURL(png);
     $('#videoTrackPreview').src=videoTrackUrl;$('#videoTrackPreview').style.display='block';$('#videoAverageSection').hidden=false;
     const base=file.name.replace(/\.[^.]+$/,'');videoTrackName='Video_tracked_'+base+'.webm';
@@ -196,8 +211,8 @@ $('#runVideoTrack').onclick = async () => {
     $('#downloadVideoTrack').disabled=$('#saveVideoTrack').disabled=$('#downloadVideoAverage').disabled=false;
     if(uncertainTimes.length){$('#videoTrackUncertain').hidden=false;$('#videoTrackUncertainList').textContent=uncertainTimes.map(t=>t.toFixed(2)+' s').join(', ');}
     status.textContent=`Finished ${positions.length} frames at ${outWidth} × ${outHeight} pixels. The background uses ${chosen.size} sampled frames. ${uncertainFrames} frames had uncertain matches.`;
-  } catch(error) {if(output && output.state==='started')try{await output.cancel()}catch{} status.textContent='Could not track video: '+error.message;console.error(error);}
-  finally {input?.dispose();controls.forEach(id=>$(id).disabled=false);$('#runVideoTrack').disabled=!$('#videoTrackFile').value;}
+  } catch(error) {if(output && output.state==='started')try{await output.cancel()}catch{} if(cancelled) status.textContent='Processing cancelled.'; else {status.textContent='Could not track video: '+error.message;console.error(error);}}
+  finally {cancelButton.hidden=true;cancelButton.onclick=null;input?.dispose();controls.forEach(id=>$(id).disabled=false);$('#runVideoTrack').disabled=!$('#videoTrackFile').value;}
 };
 
 $('#saveVideoTrack').onclick = async () => {
